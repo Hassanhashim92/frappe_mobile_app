@@ -506,7 +506,9 @@ def create_checkin_checkout(
 	checkin_doc.latitude = float(latitude) if latitude else None
 	checkin_doc.longitude = float(longitude) if longitude else None
 	checkin_doc.device_id = device_id
-	checkin_doc.notes = notes
+	# Set notes only if the field exists (it may be a custom field)
+	if notes and hasattr(checkin_doc, "notes"):
+		checkin_doc.notes = notes
 	
 	# Set geolocation (this will populate geolocation field from lat/long)
 	checkin_doc.set_geolocation()
@@ -584,6 +586,236 @@ def create_checkin_checkout(
 	if client_biometric_photo_file:
 		response["client_biometric_photo_url"] = client_biometric_photo_file.file_url
 		response["client_biometric_photo_id"] = client_biometric_photo_file.name
+	
+	return response
+
+
+@frappe.whitelist()
+def get_employee_checkin_records(
+	employee_id=None,
+	log_type=None,
+	start_date=None,
+	end_date=None,
+	limit=None,
+	offset=0
+):
+	"""
+	Get all check-in and check-out records for the logged-in employee.
+	
+	This endpoint retrieves all Employee Checkin records for the authenticated employee,
+	with optional filtering by log_type, date range, and pagination.
+	
+	Args:
+		employee_id (str, optional): Employee ID. If not provided, uses authenticated user's employee.
+		log_type (str, optional): Filter by log type ("IN" or "OUT"). If not provided, returns all.
+		start_date (str, optional): Start date filter (ISO 8601 format or YYYY-MM-DD). If not provided, no start limit.
+		end_date (str, optional): End date filter (ISO 8601 format or YYYY-MM-DD). If not provided, no end limit.
+		limit (int, optional): Maximum number of records to return. Defaults to 100 if not specified.
+		offset (int, optional): Number of records to skip for pagination. Defaults to 0.
+	
+	Returns:
+		dict: {
+			"records": [list of checkin records],
+			"total_count": total number of records matching filters,
+			"limit": limit applied,
+			"offset": offset applied,
+			"has_more": boolean indicating if more records are available
+		}
+	
+	Raises:
+		DoesNotExistError: If employee not found
+		ValidationError: If invalid parameters provided
+	"""
+	# Get employee record
+	if employee_id:
+		employee = frappe.get_doc("Employee", employee_id)
+	else:
+		# Get employee from authenticated user
+		employee_name = frappe.db.get_value("Employee", {"user_id": frappe.session.user}, "name")
+		if not employee_name:
+			frappe.throw(_("Employee not found for user {0}").format(frappe.session.user), DoesNotExistError)
+		employee = frappe.get_doc("Employee", employee_name)
+	
+	# Build filters
+	filters = {"employee": employee.name}
+	
+	# Add log_type filter if provided
+	if log_type:
+		if log_type not in ["IN", "OUT"]:
+			frappe.throw(_("log_type must be 'IN' or 'OUT'."), ValidationError)
+		filters["log_type"] = log_type
+	
+	# Add date filters if provided
+	from datetime import timezone, timedelta
+	
+	if start_date and end_date:
+		# Both dates provided - use between filter
+		try:
+			start_datetime = get_datetime(start_date)
+			if start_datetime.tzinfo is not None:
+				start_datetime = start_datetime.astimezone(timezone.utc).replace(tzinfo=None)
+			
+			end_datetime = get_datetime(end_date)
+			if end_datetime.tzinfo is not None:
+				end_datetime = end_datetime.astimezone(timezone.utc).replace(tzinfo=None)
+			# Add one day to include the entire end date
+			end_datetime = end_datetime + timedelta(days=1)
+			
+			filters["time"] = ["between", [start_datetime, end_datetime]]
+		except Exception:
+			frappe.throw(_("Invalid date format. Use ISO 8601 format or YYYY-MM-DD."), ValidationError)
+	elif start_date:
+		# Only start date provided
+		try:
+			start_datetime = get_datetime(start_date)
+			if start_datetime.tzinfo is not None:
+				start_datetime = start_datetime.astimezone(timezone.utc).replace(tzinfo=None)
+			filters["time"] = [">=", start_datetime]
+		except Exception:
+			frappe.throw(_("Invalid start_date format. Use ISO 8601 format or YYYY-MM-DD."), ValidationError)
+	elif end_date:
+		# Only end date provided
+		try:
+			end_datetime = get_datetime(end_date)
+			if end_datetime.tzinfo is not None:
+				end_datetime = end_datetime.astimezone(timezone.utc).replace(tzinfo=None)
+			# Add one day to include the entire end date
+			end_datetime = end_datetime + timedelta(days=1)
+			filters["time"] = ["<", end_datetime]
+		except Exception:
+			frappe.throw(_("Invalid end_date format. Use ISO 8601 format or YYYY-MM-DD."), ValidationError)
+	
+	# Set default limit
+	if limit is None:
+		limit = 100
+	else:
+		try:
+			limit = int(limit)
+			if limit < 1:
+				limit = 100
+		except (ValueError, TypeError):
+			limit = 100
+	
+	# Validate offset
+	try:
+		offset = int(offset)
+		if offset < 0:
+			offset = 0
+	except (ValueError, TypeError):
+		offset = 0
+	
+	# Get total count
+	total_count = frappe.db.count("Employee Checkin", filters=filters)
+	
+	# Get records with pagination, ordered by time descending (most recent first)
+	checkin_records = frappe.get_all(
+		"Employee Checkin",
+		filters=filters,
+		fields=[
+			"name",
+			"employee",
+			"employee_name",
+			"log_type",
+			"time",
+			"latitude",
+			"longitude",
+			"device_id",
+			"shift",
+			"shift_start",
+			"shift_end",
+			"attendance",
+			"skip_auto_attendance",
+			"geolocation"
+		],
+		order_by="time desc",
+		limit=limit,
+		start=offset
+	)
+	
+	# Get custom fields for location photo and biometric photo
+	records_with_photos = []
+	for record in checkin_records:
+		# Get location photo (get the most recent one if multiple exist)
+		location_photos = frappe.get_all(
+			"File",
+			filters={
+				"attached_to_doctype": "Employee Checkin",
+				"attached_to_name": record.name,
+				"file_name": ["like", "%location_photo%"]
+			},
+			fields=["name", "file_url"],
+			order_by="creation desc",
+			limit=1
+		)
+		location_photo = location_photos[0] if location_photos else None
+		
+		# Get biometric photo (get the most recent one if multiple exist)
+		biometric_photos = frappe.get_all(
+			"File",
+			filters={
+				"attached_to_doctype": "Employee Checkin",
+				"attached_to_name": record.name,
+				"file_name": ["like", "%biometric%"]
+			},
+			fields=["name", "file_url"],
+			order_by="creation desc",
+			limit=1
+		)
+		biometric_photo = biometric_photos[0] if biometric_photos else None
+		
+		# Also check custom fields if they exist
+		checkin_doc = frappe.get_doc("Employee Checkin", record.name)
+		location_photo_id = getattr(checkin_doc, "custom_location_photo", None)
+		biometric_photo_id = getattr(checkin_doc, "custom_client_bio_metric_photo", None)
+		
+		# Build record response
+		record_data = {
+			"checkin_id": record.name,
+			"employee_id": getattr(employee, "employee_code", None) or getattr(employee, "employee_number", None) or employee.name,
+			"employee_name": record.employee_name or employee.name,
+			"log_type": record.log_type,
+			"time": record.time.isoformat() if hasattr(record.time, "isoformat") else str(record.time),
+			"latitude": record.latitude,
+			"longitude": record.longitude,
+			"device_id": record.device_id,
+			"shift": record.shift,
+			"shift_start": record.shift_start.isoformat() if record.shift_start and hasattr(record.shift_start, "isoformat") else (str(record.shift_start) if record.shift_start else None),
+			"shift_end": record.shift_end.isoformat() if record.shift_end and hasattr(record.shift_end, "isoformat") else (str(record.shift_end) if record.shift_end else None),
+			"attendance": record.attendance,
+			"skip_auto_attendance": record.skip_auto_attendance,
+		}
+		
+		# Add photo information
+		if location_photo:
+			record_data["location_photo_id"] = location_photo.name
+			record_data["location_photo_url"] = location_photo.file_url
+		elif location_photo_id:
+			# Try to get file info from custom field
+			if frappe.db.exists("File", location_photo_id):
+				file_doc = frappe.get_doc("File", location_photo_id)
+				record_data["location_photo_id"] = file_doc.name
+				record_data["location_photo_url"] = file_doc.file_url
+		
+		if biometric_photo:
+			record_data["client_biometric_photo_id"] = biometric_photo.name
+			record_data["client_biometric_photo_url"] = biometric_photo.file_url
+		elif biometric_photo_id:
+			# Try to get file info from custom field
+			if frappe.db.exists("File", biometric_photo_id):
+				file_doc = frappe.get_doc("File", biometric_photo_id)
+				record_data["client_biometric_photo_id"] = file_doc.name
+				record_data["client_biometric_photo_url"] = file_doc.file_url
+		
+		records_with_photos.append(record_data)
+	
+	# Build response
+	response = {
+		"records": records_with_photos,
+		"total_count": total_count,
+		"limit": limit,
+		"offset": offset,
+		"has_more": (offset + limit) < total_count
+	}
 	
 	return response
 
