@@ -336,15 +336,34 @@ def _handle_photo_upload(photo_data, employee_id, checkin_id, photo_type="locati
 	Handle photo upload from base64 or file_id.
 	Returns file_doc or None.
 	"""
+	# frappe.log_error(
+	# 	f"DEBUG: _handle_photo_upload called - photo_type: {photo_type}, "
+	# 	f"photo_data type: {type(photo_data)}, has_data: {bool(photo_data)}, "
+	# 	f"employee_id: {employee_id}, checkin_id: {checkin_id}",
+	# 	"Checkin Photo Upload Debug"
+	# )
+	
 	if not photo_data:
+		frappe.log_error(
+			title="Checkin Photo Debug",
+			message="_handle_photo_upload - photo_data is empty/None",
+		)
 		return None
 	
 	# If it's a file_id (already uploaded), return the file doc
 	if isinstance(photo_data, str) and not photo_data.startswith("data:"):
 		# Check if it's a valid file ID
 		if frappe.db.exists("File", photo_data):
+			frappe.log_error(
+				title="Checkin Photo Debug",
+				message=f"_handle_photo_upload - treating as file_id: {photo_data}",
+			)
 			return frappe.get_doc("File", photo_data)
 		# If not a file ID, treat as base64
+		frappe.log_error(
+			title="Checkin Photo Debug",
+			message="_handle_photo_upload - treating string as base64",
+		)
 	
 	# Handle base64 encoded image
 	if isinstance(photo_data, str):
@@ -354,24 +373,52 @@ def _handle_photo_upload(photo_data, employee_id, checkin_id, photo_type="locati
 		
 		try:
 			file_bytes = base64.b64decode(photo_data)
-		except Exception:
+			frappe.log_error(
+				title="Checkin Photo Debug",
+				message=f"_handle_photo_upload - decoded base64, size: {len(file_bytes)}",
+			)
+		except Exception as e:
+			frappe.log_error(
+				title="Checkin Photo Debug",
+				message=f"_handle_photo_upload - base64 decode error: {str(e)}",
+			)
 			frappe.throw(_("Invalid base64 image data."), ValidationError)
 	else:
 		file_bytes = photo_data
+		frappe.log_error(
+			title="Checkin Photo Debug",
+			message=f"_handle_photo_upload - using bytes directly, size: {len(file_bytes) if file_bytes else 0}",
+		)
 	
 	# Generate filename
 	from frappe.utils import now_datetime
 	timestamp = now_datetime().strftime("%Y%m%d_%H%M%S")
 	filename = f"{photo_type}_photo_{employee_id}_{timestamp}.jpg"
 	
-	# Save file and attach to checkin
-	file_doc = save_file(
-		fname=filename,
-		content=file_bytes,
-		dt="Employee Checkin",
-		dn=checkin_id,
-		is_private=0
+	frappe.log_error(
+		title="Checkin Photo Debug",
+		message=f"Calling save_file - filename: {filename}, checkin: {checkin_id}, size: {len(file_bytes) if file_bytes else 0}",
 	)
+	
+	# Save file and attach to checkin
+	try:
+		file_doc = save_file(
+			fname=filename,
+			content=file_bytes,
+			dt="Employee Checkin",
+			dn=checkin_id,
+			is_private=0
+		)
+		frappe.log_error(
+			title="Checkin Photo Debug",
+			message=f"save_file successful - file_id: {file_doc.name if file_doc else 'None'}",
+		)
+	except Exception as e:
+		frappe.log_error(
+			title="Checkin Photo Debug",
+			message=f"save_file error: {str(e)}",
+		)
+		raise
 	
 	return file_doc
 
@@ -419,6 +466,134 @@ def create_checkin_checkout(
 	Returns:
 		dict: Checkin record details
 	"""
+	# Support multipart/form-data file uploads (e.g. Postman / mobile form-data)
+	# If files are sent as real files instead of base64 strings, they will be
+	# available on frappe.request.files, not in the named parameters above.
+	try:
+		request_files = getattr(frappe, "request", None) and getattr(frappe.request, "files", None)
+		frappe.log_error(
+			title="Checkin Photo Debug",
+			message=f"request_files available: {request_files is not None}, keys: {list(request_files.keys()) if request_files else 'None'}",
+		)
+	except Exception as e:
+		request_files = None
+		frappe.log_error(
+			title="Checkin Photo Debug",
+			message=f"Error getting request_files: {str(e)}",
+		)
+	
+	# Helper function to read bytes from FileStorage object
+	def _read_file_storage(file_storage):
+		"""Read bytes from a FileStorage object, handling stream position."""
+		if not file_storage:
+			return None
+		try:
+			# Reset stream to beginning in case it was partially read
+			if hasattr(file_storage, 'stream') and hasattr(file_storage.stream, 'seek'):
+				file_storage.stream.seek(0)
+			# Use read() method directly on FileStorage, or stream.read()
+			if hasattr(file_storage, 'read'):
+				return file_storage.read()
+			elif hasattr(file_storage, 'stream') and hasattr(file_storage.stream, 'read'):
+				return file_storage.stream.read()
+			else:
+				return None
+		except Exception as e:
+			frappe.log_error(
+				title="Checkin Photo Debug",
+				message=f"Error reading file_storage stream: {str(e)}",
+			)
+			return None
+
+	# Log initial state of photo parameters
+	frappe.log_error(
+		title="Checkin Photo Debug",
+		message=(
+			f"Initial params - loc_photo type: {type(location_photo)}, has_value: {bool(location_photo)}, "
+			f"bio_photo type: {type(client_biometric_photo)}, has_value: {bool(client_biometric_photo)}, "
+			f"loc_id: {location_photo_id}, bio_id: {client_biometric_photo_id}"
+		),
+	)
+
+	# For location photo: handle different input types
+	# 1. If location_photo is already bytes or base64 string, use it
+	# 2. If location_photo is a FileStorage object, read from it
+	# 3. If location_photo is None/empty, try to get from request_files
+	if location_photo:
+		# Check if it's a FileStorage object (from form_dict)
+		if hasattr(location_photo, 'read') or (hasattr(location_photo, 'stream') and hasattr(location_photo.stream, 'read')):
+			frappe.log_error(
+				title="Checkin Photo Debug",
+				message=f"location_photo is FileStorage object, reading bytes...",
+			)
+			location_photo = _read_file_storage(location_photo)
+			frappe.log_error(
+				title="Checkin Photo Debug",
+				message=f"Read location_photo from FileStorage, size: {len(location_photo) if location_photo else 0}",
+			)
+		# If it's already bytes or string, keep it as is
+		elif isinstance(location_photo, (bytes, str)):
+			frappe.log_error(
+				title="Checkin Photo Debug",
+				message=f"location_photo is already bytes/string, size: {len(location_photo) if location_photo else 0}",
+			)
+	# If location_photo is None/empty, try to get from request_files
+	elif request_files:
+		file_storage = request_files.get("location_photo")
+		if file_storage:
+			frappe.log_error(
+				title="Checkin Photo Debug",
+				message=f"Found location_photo in request_files, filename: {getattr(file_storage, 'filename', 'unknown')}",
+			)
+			location_photo = _read_file_storage(file_storage)
+			frappe.log_error(
+				title="Checkin Photo Debug",
+				message=f"Read location_photo from request_files, size: {len(location_photo) if location_photo else 0}",
+			)
+		else:
+			frappe.log_error(
+				title="Checkin Photo Debug",
+				message="location_photo not found in request_files",
+			)
+
+	# For biometric photo: same logic
+	if client_biometric_photo:
+		# Check if it's a FileStorage object (from form_dict)
+		if hasattr(client_biometric_photo, 'read') or (hasattr(client_biometric_photo, 'stream') and hasattr(client_biometric_photo.stream, 'read')):
+			frappe.log_error(
+				title="Checkin Photo Debug",
+				message=f"client_biometric_photo is FileStorage object, reading bytes...",
+			)
+			client_biometric_photo = _read_file_storage(client_biometric_photo)
+			frappe.log_error(
+				title="Checkin Photo Debug",
+				message=f"Read client_biometric_photo from FileStorage, size: {len(client_biometric_photo) if client_biometric_photo else 0}",
+			)
+		# If it's already bytes or string, keep it as is
+		elif isinstance(client_biometric_photo, (bytes, str)):
+			frappe.log_error(
+				title="Checkin Photo Debug",
+				message=f"client_biometric_photo is already bytes/string, size: {len(client_biometric_photo) if client_biometric_photo else 0}",
+			)
+	# If client_biometric_photo is None/empty, try to get from request_files
+	elif request_files:
+		file_storage = request_files.get("client_biometric_photo")
+		if file_storage:
+			frappe.log_error(
+				title="Checkin Photo Debug",
+				message=f"Found client_biometric_photo in request_files, filename: {getattr(file_storage, 'filename', 'unknown')}",
+			)
+			client_biometric_photo = _read_file_storage(file_storage)
+			frappe.log_error(
+				title="Checkin Photo Debug",
+				message=f"Read client_biometric_photo from request_files, size: {len(client_biometric_photo) if client_biometric_photo else 0}",
+			)
+		else:
+			frappe.log_error(
+				title="Checkin Photo Debug",
+				message="client_biometric_photo not found in request_files",
+			)
+
 	# Get employee record
 	if employee_id:
 		employee = frappe.get_doc("Employee", employee_id)
@@ -465,7 +640,6 @@ def create_checkin_checkout(
 				),
 				ValidationError
 			)
-		# We'll upload after creating checkin record
 	
 	# Handle client biometric photo
 	if settings["required_to_upload_client_bio_metric_photo"]:
@@ -476,7 +650,6 @@ def create_checkin_checkout(
 				),
 				ValidationError
 			)
-		# We'll upload after creating checkin record
 	
 	# Parse timestamp
 	if timestamp:
@@ -531,34 +704,108 @@ def create_checkin_checkout(
 			ValidationError
 		)
 	
-	# Upload and link photos
-	if settings["required_to_upload_location_photo"]:
-		if location_photo:
-			location_photo_file = _handle_photo_upload(
-				location_photo, employee.name, checkin_doc.name, "location"
+	# Upload and/or link photos
+	# Location photo: if a photo (or file id) is provided, always store/link it,
+	# even if the setting "required_to_upload_location_photo" is disabled.
+	frappe.log_error(
+		title="Checkin Photo Debug",
+		message=f"Before upload - loc_photo: {bool(location_photo)}, loc_id: {location_photo_id}, checkin: {checkin_doc.name}",
+	)
+	if location_photo:
+		frappe.log_error(
+			title="Checkin Photo Debug",
+			message=f"Uploading location_photo, type: {type(location_photo)}, size: {len(location_photo) if isinstance(location_photo, (bytes, str)) else 'N/A'}",
+		)
+		location_photo_file = _handle_photo_upload(
+			location_photo, employee.name, checkin_doc.name, "location"
+		)
+		frappe.log_error(
+			title="Checkin Photo Debug",
+			message=f"location_photo upload result - created: {location_photo_file is not None}, file_id: {location_photo_file.name if location_photo_file else 'None'}",
+		)
+	elif location_photo_id:
+		# Link existing file
+		frappe.log_error(
+			title="Checkin Photo Debug",
+			message=f"Linking existing file: {location_photo_id}",
+		)
+		if frappe.db.exists("File", location_photo_id):
+			file_doc = frappe.get_doc("File", location_photo_id)
+			file_doc.attached_to_doctype = "Employee Checkin"
+			file_doc.attached_to_name = checkin_doc.name
+			file_doc.save(ignore_permissions=True)
+			location_photo_file = file_doc
+			frappe.log_error(
+				title="Checkin Photo Debug",
+				message=f"Linked location_photo_id: {location_photo_id}",
 			)
-		elif location_photo_id:
-			# Link existing file
-			if frappe.db.exists("File", location_photo_id):
-				file_doc = frappe.get_doc("File", location_photo_id)
-				file_doc.attached_to_doctype = "Employee Checkin"
-				file_doc.attached_to_name = checkin_doc.name
-				file_doc.save(ignore_permissions=True)
-				location_photo_file = file_doc
+		else:
+			frappe.log_error(
+				title="Checkin Photo Debug",
+				message=f"File not found for location_photo_id: {location_photo_id}",
+			)
+	else:
+		frappe.log_error(
+			title="Checkin Photo Debug",
+			message="No location_photo or location_photo_id provided",
+		)
 	
-	if settings["required_to_upload_client_bio_metric_photo"]:
-		if client_biometric_photo:
-			client_biometric_photo_file = _handle_photo_upload(
-				client_biometric_photo, employee.name, checkin_doc.name, "biometric"
+	# Client biometric photo: same behavior
+	frappe.log_error(
+		title="Checkin Photo Debug",
+		message=f"Before upload - bio_photo: {bool(client_biometric_photo)}, bio_id: {client_biometric_photo_id}",
+	)
+	if client_biometric_photo:
+		frappe.log_error(
+			title="Checkin Photo Debug",
+			message=f"Uploading client_biometric_photo, type: {type(client_biometric_photo)}, size: {len(client_biometric_photo) if isinstance(client_biometric_photo, (bytes, str)) else 'N/A'}",
+		)
+		client_biometric_photo_file = _handle_photo_upload(
+			client_biometric_photo, employee.name, checkin_doc.name, "biometric"
+		)
+		frappe.log_error(
+			title="Checkin Photo Debug",
+			message=f"client_biometric_photo upload result - created: {client_biometric_photo_file is not None}, file_id: {client_biometric_photo_file.name if client_biometric_photo_file else 'None'}",
+		)
+	elif client_biometric_photo_id:
+		# Link existing file
+		frappe.log_error(
+			title="Checkin Photo Debug",
+			message=f"Linking existing file: {client_biometric_photo_id}",
+		)
+		if frappe.db.exists("File", client_biometric_photo_id):
+			file_doc = frappe.get_doc("File", client_biometric_photo_id)
+			file_doc.attached_to_doctype = "Employee Checkin"
+			file_doc.attached_to_name = checkin_doc.name
+			file_doc.save(ignore_permissions=True)
+			client_biometric_photo_file = file_doc
+			frappe.log_error(
+				title="Checkin Photo Debug",
+				message=f"Linked client_biometric_photo_id: {client_biometric_photo_id}",
 			)
-		elif client_biometric_photo_id:
-			# Link existing file
-			if frappe.db.exists("File", client_biometric_photo_id):
-				file_doc = frappe.get_doc("File", client_biometric_photo_id)
-				file_doc.attached_to_doctype = "Employee Checkin"
-				file_doc.attached_to_name = checkin_doc.name
-				file_doc.save(ignore_permissions=True)
-				client_biometric_photo_file = file_doc
+		else:
+			frappe.log_error(
+				title="Checkin Photo Debug",
+				message=f"File not found for client_biometric_photo_id: {client_biometric_photo_id}",
+			)
+	else:
+		frappe.log_error(
+			title="Checkin Photo Debug",
+			message="No client_biometric_photo or client_biometric_photo_id provided",
+		)
+
+	# If custom Attach fields exist on Employee Checkin, populate them with file URLs
+	# so that they show up in the form's "Location Photo" and "Client Bio Metric Photo" fields.
+	# These are expected to be Data/Attach fields named:
+	# - custom_location_photo
+	# - custom_client_bio_metric_photo
+	updated_values = {}
+	if location_photo_file and hasattr(checkin_doc, "custom_location_photo"):
+		updated_values["custom_location_photo"] = location_photo_file.file_url
+	if client_biometric_photo_file and hasattr(checkin_doc, "custom_client_bio_metric_photo"):
+		updated_values["custom_client_bio_metric_photo"] = client_biometric_photo_file.file_url
+	if updated_values:
+		frappe.db.set_value("Employee Checkin", checkin_doc.name, updated_values, update_modified=False)
 	
 	# Build response
 	response = {
