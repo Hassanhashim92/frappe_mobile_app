@@ -6,6 +6,129 @@ from hrms.hr.utils import get_distance_between_coordinates, validate_active_empl
 from hrms.hr.doctype.employee_checkin.employee_checkin import CheckinRadiusExceededError
 import base64
 from frappe.utils.file_manager import save_file
+from frappe.auth import LoginManager
+
+
+@frappe.whitelist(allow_guest=True)
+def mobile_login(usr=None, pwd=None, has_existing_token=False):
+	"""
+	Mobile app login endpoint with API credential generation.
+	
+	This endpoint:
+	1. Authenticates user using standard ERPNext login
+	2. Generates API credentials if needed (based on has_existing_token flag)
+	3. Returns login response with API credentials
+	
+	Args:
+		usr (str, required): ERPNext username
+		pwd (str, required): ERPNext password
+		has_existing_token (bool, optional): 
+			- False: Generate new API credentials if user doesn't have them
+			- True: Skip credential generation (assumes mobile already has credentials)
+	
+	Returns:
+		dict: {
+			"login": {standard login response},
+			"api_credentials": {
+				"token": str (format: "api_key:api_secret"),
+				"generated": bool,
+				"message": str
+			}
+		}
+	
+	Raises:
+		ValidationError: If login fails or credentials cannot be generated
+	"""
+	# Validate required parameters
+	if not usr:
+		frappe.throw(_("Username is required."), ValidationError)
+	
+	if not pwd:
+		frappe.throw(_("Password is required."), ValidationError)
+	
+	# Convert has_existing_token to boolean (handles string "true"/"false" from API)
+	if isinstance(has_existing_token, str):
+		has_existing_token = has_existing_token.lower() in ("true", "1", "yes")
+	else:
+		has_existing_token = bool(has_existing_token)
+	
+	# Perform standard ERPNext login
+	try:
+		login_manager = LoginManager()
+		login_manager.authenticate(usr, pwd)
+		
+		if not login_manager.user:
+			frappe.throw(_("Invalid login credentials. Please check your username and password."), ValidationError)
+		
+		# Login successful - create session
+		login_manager.post_login()
+		
+	except frappe.exceptions.AuthenticationError as e:
+		# Handle authentication errors (wrong password, user disabled, etc.)
+		frappe.throw(_("Login failed: {0}").format(str(e)), ValidationError)
+	except Exception as e:
+		# Handle any other login errors
+		frappe.throw(_("Login error: {0}").format(str(e)), ValidationError)
+	
+	# Get user document
+	try:
+		user_doc = frappe.get_doc("User", login_manager.user)
+	except Exception as e:
+		frappe.throw(_("Error retrieving user information: {0}").format(str(e)), ValidationError)
+	
+	# Initialize response
+	login_response = {
+		"message": "Logged In",
+		"home_page": "/app",
+		"full_name": user_doc.full_name or user_doc.name,
+		"sid": frappe.session.sid if hasattr(frappe.session, 'sid') else None
+	}
+	
+	# Handle API credentials based on has_existing_token flag
+	api_credentials = {}
+	
+	if has_existing_token:
+		# Mobile app has existing token - don't generate new one
+		api_credentials = {
+			"token": None,
+			"generated": False,
+			"message": "Using existing API credentials."
+		}
+	else:
+		# Mobile app doesn't have token - generate new credentials
+		# If user already has api_key, we'll regenerate secret (since secret is hashed and can't be retrieved)
+		try:
+			# Check if user has existing API key
+			has_api_key = bool(user_doc.api_key)
+			
+			# Generate API key and secret using Frappe's method
+			api_secret = frappe.generate_hash(length=15)
+			if not user_doc.api_key:
+				api_key = frappe.generate_hash(length=15)
+				user_doc.api_key = api_key
+			else:
+				api_key = user_doc.api_key
+			user_doc.api_secret = api_secret
+			user_doc.save(ignore_permissions=True)
+			frappe.db.commit()
+			
+			# Format token as api_key:api_secret
+			token = f"{api_key}:{api_secret}"
+			api_credentials = {
+				"token": token,
+				"generated": True,
+				"message": "API credentials generated successfully." if not has_api_key else "New API credentials generated. Old credentials are now invalid."
+			}
+		except Exception as e:
+			frappe.throw(_("Error generating API credentials: {0}").format(str(e)), ValidationError)
+	
+	# Build final response
+	response = {
+		"login": login_response,
+		"api_credentials": api_credentials
+	}
+	
+	return response
 
 
 @frappe.whitelist()
@@ -307,17 +430,42 @@ def _validate_location(latitude, longitude, branch_latitude, branch_longitude, b
 	Raises ValidationError if outside radius.
 	"""
 	if not latitude or not longitude:
-		frappe.throw(_("Latitude and longitude are required for check-in/check-out."), ValidationError)
+		action = "check-in" if log_type == "IN" else "check-out"
+		frappe.throw(
+			_("Location coordinates are required for {0}. Please enable GPS and try again.").format(action),
+			ValidationError
+		)
 	
 	try:
 		latitude = float(latitude)
 		longitude = float(longitude)
-	except (ValueError, TypeError):
-		frappe.throw(_("Invalid latitude or longitude values."), ValidationError)
+	except (ValueError, TypeError) as e:
+		frappe.throw(
+			_("Invalid location coordinates. Please ensure GPS is enabled and try again. Error: {0}").format(str(e)),
+			ValidationError
+		)
 	
-	distance = get_distance_between_coordinates(
-		branch_latitude, branch_longitude, latitude, longitude
-	)
+	# Validate coordinate ranges
+	if not (-90 <= latitude <= 90):
+		frappe.throw(
+			_("Invalid latitude value. Latitude must be between -90 and 90 degrees."),
+			ValidationError
+		)
+	if not (-180 <= longitude <= 180):
+		frappe.throw(
+			_("Invalid longitude value. Longitude must be between -180 and 180 degrees."),
+			ValidationError
+		)
+	
+	try:
+		distance = get_distance_between_coordinates(
+			branch_latitude, branch_longitude, latitude, longitude
+		)
+	except Exception as e:
+		frappe.throw(
+			_("Error calculating distance from branch location. Please try again. Error: {0}").format(str(e)),
+			ValidationError
+		)
 	
 	if distance > branch_radius:
 		action = "check in" if log_type == "IN" else "check out"
@@ -373,6 +521,11 @@ def _handle_photo_upload(photo_data, employee_id, checkin_id, photo_type="locati
 		
 		try:
 			file_bytes = base64.b64decode(photo_data)
+			if not file_bytes or len(file_bytes) == 0:
+				frappe.throw(
+					_("Invalid image data. The photo appears to be empty. Please capture the photo again."),
+					ValidationError
+				)
 			frappe.log_error(
 				title="Checkin Photo Debug",
 				message=f"_handle_photo_upload - decoded base64, size: {len(file_bytes)}",
@@ -382,7 +535,10 @@ def _handle_photo_upload(photo_data, employee_id, checkin_id, photo_type="locati
 				title="Checkin Photo Debug",
 				message=f"_handle_photo_upload - base64 decode error: {str(e)}",
 			)
-			frappe.throw(_("Invalid base64 image data."), ValidationError)
+			frappe.throw(
+				_("Invalid image format. Please ensure the photo is properly encoded and try again."),
+				ValidationError
+			)
 	else:
 		file_bytes = photo_data
 		frappe.log_error(
@@ -402,6 +558,20 @@ def _handle_photo_upload(photo_data, employee_id, checkin_id, photo_type="locati
 	
 	# Save file and attach to checkin
 	try:
+		if not file_bytes or len(file_bytes) == 0:
+			frappe.throw(
+				_("Photo file is empty. Please capture the photo again and try uploading."),
+				ValidationError
+			)
+		
+		# Validate file size (max 5MB as per documentation)
+		max_size = 5 * 1024 * 1024  # 5MB in bytes
+		if len(file_bytes) > max_size:
+			frappe.throw(
+				_("Photo file size exceeds the maximum limit of 5MB. Please compress the image and try again."),
+				ValidationError
+			)
+		
 		file_doc = save_file(
 			fname=filename,
 			content=file_bytes,
@@ -413,12 +583,18 @@ def _handle_photo_upload(photo_data, employee_id, checkin_id, photo_type="locati
 			title="Checkin Photo Debug",
 			message=f"save_file successful - file_id: {file_doc.name if file_doc else 'None'}",
 		)
+	except ValidationError:
+		# Re-raise validation errors as-is
+		raise
 	except Exception as e:
 		frappe.log_error(
 			title="Checkin Photo Debug",
 			message=f"save_file error: {str(e)}",
 		)
-		raise
+		frappe.throw(
+			_("Error uploading photo. Please try again. If the problem persists, contact support."),
+			ValidationError
+		)
 	
 	return file_doc
 
@@ -594,21 +770,45 @@ def create_checkin_checkout(
 				message="client_biometric_photo not found in request_files",
 			)
 
-	# Get employee record
+	# Get employee record with clear error messages
 	if employee_id:
-		employee = frappe.get_doc("Employee", employee_id)
+		if not frappe.db.exists("Employee", employee_id):
+			frappe.throw(
+				_("Employee not found. Please check the employee ID and try again."),
+				DoesNotExistError
+			)
+		try:
+			employee = frappe.get_doc("Employee", employee_id)
+		except Exception as e:
+			frappe.throw(
+				_("Error retrieving employee record: {0}").format(str(e)),
+				DoesNotExistError
+			)
 	else:
 		employee_name = frappe.db.get_value("Employee", {"user_id": frappe.session.user}, "name")
 		if not employee_name:
-			frappe.throw(_("Employee not found for user {0}").format(frappe.session.user), DoesNotExistError)
-		employee = frappe.get_doc("Employee", employee_name)
+			frappe.throw(
+				_("Employee not found for user {0}. Please ensure your user account is linked to an employee record.").format(frappe.session.user),
+				DoesNotExistError
+			)
+		try:
+			employee = frappe.get_doc("Employee", employee_name)
+		except Exception as e:
+			frappe.throw(
+				_("Error retrieving employee record: {0}").format(str(e)),
+				DoesNotExistError
+			)
 	
 	# Validate employee is active
+	# The validate_active_employee function will throw a clear error if employee is inactive
 	validate_active_employee(employee.name)
 	
 	# Validate log_type
-	if log_type not in ["IN", "OUT"]:
-		frappe.throw(_("log_type must be 'IN' or 'OUT'."), ValidationError)
+	if not log_type or log_type not in ["IN", "OUT"]:
+		frappe.throw(
+			_("Invalid log_type. Must be 'IN' for check-in or 'OUT' for check-out."),
+			ValidationError
+		)
 	
 	# Get employee settings and branch info
 	settings = _get_employee_settings(employee)
@@ -616,7 +816,27 @@ def create_checkin_checkout(
 	# Validate location
 	# For check-in: always required
 	# For check-out: only if require_location_check_on_check_out is True
-	if log_type == "IN" or settings["require_location_check_on_check_out"]:
+	if log_type == "IN":
+		# Check-in: location is always required
+		if not latitude or not longitude:
+			frappe.throw(
+				_("Location is required for check-in. Please provide latitude and longitude."),
+				ValidationError
+			)
+		distance = _validate_location(
+			latitude, longitude,
+			settings["branch_latitude"],
+			settings["branch_longitude"],
+			settings["branch_radius"],
+			log_type
+		)
+	elif settings["require_location_check_on_check_out"]:
+		# Check-out: location required only if setting is true
+		if not latitude or not longitude:
+			frappe.throw(
+				_("Location is required for check-out. Please provide latitude and longitude."),
+				ValidationError
+			)
 		distance = _validate_location(
 			latitude, longitude,
 			settings["branch_latitude"],
@@ -625,33 +845,45 @@ def create_checkin_checkout(
 			log_type
 		)
 	else:
+		# Check-out: location not required
 		distance = None
 	
 	# Validate required photos
 	location_photo_file = None
 	client_biometric_photo_file = None
 	
+	# Validate required photos with clear error messages
 	# Handle location photo
 	if settings["required_to_upload_location_photo"]:
 		if not location_photo and not location_photo_id:
+			action = "check-in" if log_type == "IN" else "check-out"
 			frappe.throw(
-				_("Location photo is required. Please upload location photo before {0}.").format(
-					"check-in" if log_type == "IN" else "check-out"
-				),
+				_("Location photo is required for {0}. Please capture and upload a location photo before proceeding.").format(action),
+				ValidationError
+			)
+		# Validate that if location_photo_id is provided, the file exists
+		if location_photo_id and not frappe.db.exists("File", location_photo_id):
+			frappe.throw(
+				_("Location photo file not found. Please upload the photo again."),
 				ValidationError
 			)
 	
 	# Handle client biometric photo
 	if settings["required_to_upload_client_bio_metric_photo"]:
 		if not client_biometric_photo and not client_biometric_photo_id:
+			action = "check-in" if log_type == "IN" else "check-out"
 			frappe.throw(
-				_("Client biometric photo is required. Please upload client biometric photo before {0}.").format(
-					"check-in" if log_type == "IN" else "check-out"
-				),
+				_("Client biometric photo is required for {0}. Please capture and upload a client biometric photo before proceeding.").format(action),
+				ValidationError
+			)
+		# Validate that if client_biometric_photo_id is provided, the file exists
+		if client_biometric_photo_id and not frappe.db.exists("File", client_biometric_photo_id):
+			frappe.throw(
+				_("Client biometric photo file not found. Please upload the photo again."),
 				ValidationError
 			)
 	
-	# Parse timestamp
+	# Parse timestamp with clear error message
 	if timestamp:
 		try:
 			checkin_time = get_datetime(timestamp)
@@ -663,8 +895,11 @@ def create_checkin_checkout(
 				checkin_time = checkin_time.astimezone(timezone.utc).replace(tzinfo=None)
 			# Remove microseconds as Employee Checkin doctype does
 			checkin_time = checkin_time.replace(microsecond=0)
-		except Exception:
-			frappe.throw(_("Invalid timestamp format. Use ISO 8601 format."), ValidationError)
+		except Exception as e:
+			frappe.throw(
+				_("Invalid timestamp format. Please use ISO 8601 format (e.g., 2025-01-27T09:15:30Z). Error: {0}").format(str(e)),
+				ValidationError
+			)
 	else:
 		checkin_time = get_datetime()
 		# Remove microseconds as Employee Checkin doctype does
@@ -692,7 +927,7 @@ def create_checkin_checkout(
 	# Validate duplicate log (this is done in Employee Checkin validate method)
 	# We'll let the doc validation handle it
 	
-	# Insert the checkin record
+	# Insert the checkin record with proper error handling
 	try:
 		checkin_doc.insert()
 		# Explicitly commit so that the record is guaranteed to be written
@@ -700,9 +935,23 @@ def create_checkin_checkout(
 		frappe.db.commit()
 	except frappe.DuplicateEntryError:
 		frappe.throw(
-			_("Duplicate check-in found for this timestamp. Please try again."),
+			_("A check-in record already exists for this timestamp. Please wait a moment and try again, or use a different timestamp."),
 			ValidationError
 		)
+	except Exception as e:
+		# Catch any other validation errors from Employee Checkin doctype
+		error_msg = str(e)
+		if "duplicate" in error_msg.lower():
+			frappe.throw(
+				_("A check-in record already exists for this timestamp. Please wait a moment and try again."),
+				ValidationError
+			)
+		else:
+			# Re-raise with clearer message if possible
+			frappe.throw(
+				_("Error creating check-in record: {0}").format(error_msg),
+				ValidationError
+			)
 	
 	# Upload and/or link photos
 	# Location photo: if a photo (or file id) is provided, always store/link it,
