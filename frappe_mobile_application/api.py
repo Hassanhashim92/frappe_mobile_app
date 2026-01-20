@@ -225,9 +225,9 @@ def get_employee_configuration(employee_id=None):
 		
 		department_doc = frappe.get_doc("Department", department)
 		# Get settings fields safely (they may be custom fields)
-		required_to_upload_location_photo = getattr(department_doc, "required_to_upload_location_photo", None)
-		required_to_upload_client_bio_metric_photo = getattr(department_doc, "required_to_upload_client_bio_metric_photo", None)
-		require_location_check_on_check_out = getattr(department_doc, "require_location_check_on_check_out", None)
+		required_to_upload_location_photo = getattr(department_doc, "custom_required_to_upload_location_photo", None)
+		required_to_upload_client_bio_metric_photo = getattr(department_doc, "custom_required_to_upload_client_bio_metric_photo", None)
+		require_location_check_on_check_out = getattr(department_doc, "custom_required_location_check_on_check_out", None)
 		
 		# Check if settings fields exist in the doctype
 		if not hasattr(department_doc, "required_to_upload_location_photo") and \
@@ -267,12 +267,12 @@ def get_employee_configuration(employee_id=None):
 		# Get settings fields safely (they may be custom fields)
 		required_to_upload_location_photo = getattr(project_doc, "custom_required_to_upload_location_photo", None)
 		required_to_upload_client_bio_metric_photo = getattr(project_doc, "custom_required_to_upload_client_bio_metric_photo", None)
-		require_location_check_on_check_out = getattr(project_doc, "custom_require_location_check_on_check_out", None)
+		require_location_check_on_check_out = getattr(project_doc, "custom_required_location_check_on_check_out", None)
 		
 		# Check if settings fields exist in the doctype
 		if not hasattr(project_doc, "custom_required_to_upload_location_photo") and \
 		   not hasattr(project_doc, "custom_required_to_upload_client_bio_metric_photo") and \
-		   not hasattr(project_doc, "custom_require_location_check_on_check_out"):
+		   not hasattr(project_doc, "custom_required_location_check_on_check_out"):
 			frappe.throw(
 				_("Company setting requires Project settings, but linked Project has no validation settings configured. Please configure settings in Project."),
 				ValidationError
@@ -348,13 +348,13 @@ def _get_employee_settings(employee):
 			)
 		
 		department_doc = frappe.get_doc("Department", department)
-		required_to_upload_location_photo = getattr(department_doc, "required_to_upload_location_photo", None)
-		required_to_upload_client_bio_metric_photo = getattr(department_doc, "required_to_upload_client_bio_metric_photo", None)
-		require_location_check_on_check_out = getattr(department_doc, "require_location_check_on_check_out", None)
+		required_to_upload_location_photo = getattr(department_doc, "custom_required_to_upload_location_photo", None)
+		required_to_upload_client_bio_metric_photo = getattr(department_doc, "custom_required_to_upload_client_bio_metric_photo", None)
+		require_location_check_on_check_out = getattr(department_doc, "custom_required_location_check_on_check_out", None)
 		
-		if not (hasattr(department_doc, "required_to_upload_location_photo") or \
-		        hasattr(department_doc, "required_to_upload_client_bio_metric_photo") or \
-		        hasattr(department_doc, "require_location_check_on_check_out")):
+		if not (hasattr(department_doc, "custom_required_to_upload_location_photo") or \
+		        hasattr(department_doc, "custom_required_to_upload_client_bio_metric_photo") or \
+		        hasattr(department_doc, "custom_required_location_check_on_check_out")):
 			frappe.throw(
 				_("Company setting requires Department settings, but Department has no validation settings configured."),
 				ValidationError
@@ -382,11 +382,11 @@ def _get_employee_settings(employee):
 		project_doc = frappe.get_doc("Project", project)
 		required_to_upload_location_photo = getattr(project_doc, "custom_required_to_upload_location_photo", None)
 		required_to_upload_client_bio_metric_photo = getattr(project_doc, "custom_required_to_upload_client_bio_metric_photo", None)
-		require_location_check_on_check_out = getattr(project_doc, "custom_require_location_check_on_check_out", None)
+		require_location_check_on_check_out = getattr(project_doc, "custom_required_location_check_on_check_out", None)
 		
 		if not (hasattr(project_doc, "custom_required_to_upload_location_photo") or \
 		        hasattr(project_doc, "custom_required_to_upload_client_bio_metric_photo") or \
-		        hasattr(project_doc, "custom_require_location_check_on_check_out")):
+		        hasattr(project_doc, "custom_required_location_check_on_check_out")):
 			frappe.throw(
 				_("Company setting requires Project settings, but linked Project has no validation settings configured."),
 				ValidationError
