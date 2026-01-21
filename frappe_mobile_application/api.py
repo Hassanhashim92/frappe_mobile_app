@@ -165,7 +165,7 @@ def get_employee_configuration(employee_id=None):
 	# Get employee basic information
 	employee_name = getattr(employee, "employee_name", None) or employee.name
 	# Try employee_code first, then employee_number, then fallback to name
-	employee_code = getattr(employee, "employee_code", None) or getattr(employee, "employee_number", None) or employee.name
+	employee_code = employee.name
 	# Get email from various possible fields
 	email = getattr(employee, "company_email", None)
 	if not email:
@@ -904,6 +904,29 @@ def create_checkin_checkout(
 		checkin_time = get_datetime()
 		# Remove microseconds as Employee Checkin doctype does
 		checkin_time = checkin_time.replace(microsecond=0)
+	
+	# Ensure only one check-in and one check-out per employee per date
+	# We consider the "date" component of checkin_time (already made naive above).
+	from datetime import timedelta
+	start_of_day = checkin_time.replace(hour=0, minute=0, second=0, microsecond=0)
+	end_of_day = start_of_day + timedelta(days=1)
+	
+	existing_count = frappe.db.count(
+		"Employee Checkin",
+		filters={
+			"employee": employee.name,
+			"log_type": log_type,
+			"time": ["between", [start_of_day, end_of_day]],
+		},
+	)
+	if existing_count > 0:
+		action = "check-in" if log_type == "IN" else "check-out"
+		frappe.throw(
+			_(
+				"You already have a {0} record for {1}. Only one check-in and one check-out are allowed per day."
+			).format(action, start_of_day.date().isoformat()),
+			ValidationError,
+		)
 	
 	# Create Employee Checkin record
 	checkin_doc = frappe.new_doc("Employee Checkin")
