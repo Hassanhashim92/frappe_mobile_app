@@ -7,6 +7,7 @@ from hrms.hr.doctype.employee_checkin.employee_checkin import CheckinRadiusExcee
 import base64
 from frappe.utils.file_manager import save_file
 from frappe.auth import LoginManager
+import json
 
 
 @frappe.whitelist(allow_guest=True)
@@ -230,9 +231,9 @@ def get_employee_configuration(employee_id=None):
 		require_location_check_on_check_out = getattr(department_doc, "custom_required_location_check_on_check_out", None)
 		
 		# Check if settings fields exist in the doctype
-		if not hasattr(department_doc, "required_to_upload_location_photo") and \
-		   not hasattr(department_doc, "required_to_upload_client_bio_metric_photo") and \
-		   not hasattr(department_doc, "require_location_check_on_check_out"):
+		if not hasattr(department_doc, "custom_required_to_upload_location_photo") and \
+		   not hasattr(department_doc, "custom_required_to_upload_client_bio_metric_photo") and \
+		   not hasattr(department_doc, "custom_required_location_check_on_check_out"):
 			frappe.throw(
 				_("Company setting requires Department settings, but Department has no validation settings configured. Please configure settings in Department."),
 				ValidationError
@@ -319,6 +320,11 @@ def get_employee_configuration(employee_id=None):
 		"branch": branch_info,
 		"settings": settings,
 	}
+
+	frappe.log_error(
+		title="Employee Configuration",
+		message=json.dumps(response, indent=4),
+	)
 	
 	return response
 
@@ -625,490 +631,301 @@ def create_checkin_checkout(
 	5. Links photos to checkin record
 	6. Applies all existing Employee Checkin validations
 	
-	Args:
-		employee_id (str, optional): Employee ID. If not provided, uses authenticated user's employee.
-		log_type (str): "IN" for check-in, "OUT" for check-out
-		latitude (float): GPS latitude
-		longitude (float): GPS longitude
-		device_id (str, optional): Device identifier
-		location_photo (str, optional): Base64 encoded image or file_id for location photo
-		client_biometric_photo (str, optional): Base64 encoded image or file_id for biometric photo
-		timestamp (str, optional): ISO 8601 timestamp (defaults to current time)
-		notes (str, optional): Optional notes
-		checkin_id (str, optional): For checkout, link to original checkin_id
-		location_photo_id (str, optional): Pre-uploaded file ID for location photo
-		client_biometric_photo_id (str, optional): Pre-uploaded file ID for biometric photo
-	
-	Returns:
-		dict: Checkin record details
+	All errors are returned to the mobile app in the minimal format:
+		{ "exception": "<message>" }
 	"""
-	# Support multipart/form-data file uploads (e.g. Postman / mobile form-data)
-	# If files are sent as real files instead of base64 strings, they will be
-	# available on frappe.request.files, not in the named parameters above.
 	try:
-		request_files = getattr(frappe, "request", None) and getattr(frappe.request, "files", None)
-		frappe.log_error(
-			title="Checkin Photo Debug",
-			message=f"request_files available: {request_files is not None}, keys: {list(request_files.keys()) if request_files else 'None'}",
-		)
-	except Exception as e:
-		request_files = None
-		frappe.log_error(
-			title="Checkin Photo Debug",
-			message=f"Error getting request_files: {str(e)}",
-		)
-	
-	# Helper function to read bytes from FileStorage object
-	def _read_file_storage(file_storage):
-		"""Read bytes from a FileStorage object, handling stream position."""
-		if not file_storage:
-			return None
+		# Support multipart/form-data file uploads (e.g. Postman / mobile form-data).
+		# If files are sent as real files instead of base64 strings, they will be
+		# available on frappe.request.files, not in the named parameters above.
 		try:
-			# Reset stream to beginning in case it was partially read
-			if hasattr(file_storage, 'stream') and hasattr(file_storage.stream, 'seek'):
-				file_storage.stream.seek(0)
-			# Use read() method directly on FileStorage, or stream.read()
-			if hasattr(file_storage, 'read'):
-				return file_storage.read()
-			elif hasattr(file_storage, 'stream') and hasattr(file_storage.stream, 'read'):
-				return file_storage.stream.read()
-			else:
+			request_files = getattr(frappe, "request", None) and getattr(frappe.request, "files", None)
+		except Exception:
+			request_files = None
+		
+		def _read_file_storage(file_storage):
+			"""Read bytes from a FileStorage object, handling stream position."""
+			if not file_storage:
 				return None
-		except Exception as e:
-			frappe.log_error(
-				title="Checkin Photo Debug",
-				message=f"Error reading file_storage stream: {str(e)}",
+			try:
+				if hasattr(file_storage, "stream") and hasattr(file_storage.stream, "seek"):
+					file_storage.stream.seek(0)
+				if hasattr(file_storage, "read"):
+					return file_storage.read()
+				if hasattr(file_storage, "stream") and hasattr(file_storage.stream, "read"):
+					return file_storage.stream.read()
+				return None
+			except Exception as e:
+				frappe.log_error(
+					title="Checkin Photo Debug",
+					message=f"Error reading file_storage stream: {str(e)}",
+				)
+				return None
+		
+		# For location photo: handle different input types
+		if location_photo:
+			# If it's a FileStorage-like object, read bytes from it
+			if hasattr(location_photo, "read") or (
+				hasattr(location_photo, "stream") and hasattr(location_photo.stream, "read")
+			):
+				location_photo = _read_file_storage(location_photo)
+		elif request_files:
+			file_storage = request_files.get("location_photo")
+			if file_storage:
+				location_photo = _read_file_storage(file_storage)
+		
+		# For biometric photo: same logic
+		if client_biometric_photo:
+			if hasattr(client_biometric_photo, "read") or (
+				hasattr(client_biometric_photo, "stream") and hasattr(client_biometric_photo.stream, "read")
+			):
+				client_biometric_photo = _read_file_storage(client_biometric_photo)
+		elif request_files:
+			file_storage = request_files.get("client_biometric_photo")
+			if file_storage:
+				client_biometric_photo = _read_file_storage(file_storage)
+		
+		# Get employee record with clear error messages
+		if employee_id:
+			if not frappe.db.exists("Employee", employee_id):
+				raise DoesNotExistError(
+					_("Employee not found. Please check the employee ID and try again.")
+				)
+			try:
+				employee = frappe.get_doc("Employee", employee_id)
+			except Exception as e:
+				raise DoesNotExistError(
+					_("Error retrieving employee record: {0}").format(str(e))
+				)
+		else:
+			employee_name = frappe.db.get_value("Employee", {"user_id": frappe.session.user}, "name")
+			if not employee_name:
+				raise DoesNotExistError(
+					_("Employee not found for user {0}. Please ensure your user account is linked to an employee record.").format(
+						frappe.session.user
+					)
+				)
+			try:
+				employee = frappe.get_doc("Employee", employee_name)
+			except Exception as e:
+				raise DoesNotExistError(
+					_("Error retrieving employee record: {0}").format(str(e))
+				)
+		
+		# Validate employee is active
+		validate_active_employee(employee.name)
+		
+		# Validate log_type
+		if log_type not in ("IN", "OUT"):
+			raise ValidationError(
+				_("Invalid log_type. Must be 'IN' for check-in or 'OUT' for check-out.")
 			)
-			return None
-
-	# Log initial state of photo parameters
-	frappe.log_error(
-		title="Checkin Photo Debug",
-		message=(
-			f"Initial params - loc_photo type: {type(location_photo)}, has_value: {bool(location_photo)}, "
-			f"bio_photo type: {type(client_biometric_photo)}, has_value: {bool(client_biometric_photo)}, "
-			f"loc_id: {location_photo_id}, bio_id: {client_biometric_photo_id}"
-		),
-	)
-
-	# For location photo: handle different input types
-	# 1. If location_photo is already bytes or base64 string, use it
-	# 2. If location_photo is a FileStorage object, read from it
-	# 3. If location_photo is None/empty, try to get from request_files
-	if location_photo:
-		# Check if it's a FileStorage object (from form_dict)
-		if hasattr(location_photo, 'read') or (hasattr(location_photo, 'stream') and hasattr(location_photo.stream, 'read')):
-			frappe.log_error(
-				title="Checkin Photo Debug",
-				message=f"location_photo is FileStorage object, reading bytes...",
+		
+		# Get employee settings and branch info
+		settings = _get_employee_settings(employee)
+		
+		# Validate location
+		if log_type == "IN":
+			if not latitude or not longitude:
+				raise ValidationError(
+					_("Location is required for check-in. Please provide latitude and longitude.")
+				)
+			distance = _validate_location(
+				latitude,
+				longitude,
+				settings["branch_latitude"],
+				settings["branch_longitude"],
+				settings["branch_radius"],
+				log_type,
 			)
-			location_photo = _read_file_storage(location_photo)
-			frappe.log_error(
-				title="Checkin Photo Debug",
-				message=f"Read location_photo from FileStorage, size: {len(location_photo) if location_photo else 0}",
-			)
-		# If it's already bytes or string, keep it as is
-		elif isinstance(location_photo, (bytes, str)):
-			frappe.log_error(
-				title="Checkin Photo Debug",
-				message=f"location_photo is already bytes/string, size: {len(location_photo) if location_photo else 0}",
-			)
-	# If location_photo is None/empty, try to get from request_files
-	elif request_files:
-		file_storage = request_files.get("location_photo")
-		if file_storage:
-			frappe.log_error(
-				title="Checkin Photo Debug",
-				message=f"Found location_photo in request_files, filename: {getattr(file_storage, 'filename', 'unknown')}",
-			)
-			location_photo = _read_file_storage(file_storage)
-			frappe.log_error(
-				title="Checkin Photo Debug",
-				message=f"Read location_photo from request_files, size: {len(location_photo) if location_photo else 0}",
+		elif settings["require_location_check_on_check_out"]:
+			if not latitude or not longitude:
+				raise ValidationError(
+					_("Location is required for check-out. Please provide latitude and longitude.")
+				)
+			distance = _validate_location(
+				latitude,
+				longitude,
+				settings["branch_latitude"],
+				settings["branch_longitude"],
+				settings["branch_radius"],
+				log_type,
 			)
 		else:
-			frappe.log_error(
-				title="Checkin Photo Debug",
-				message="location_photo not found in request_files",
-			)
-
-	# For biometric photo: same logic
-	if client_biometric_photo:
-		# Check if it's a FileStorage object (from form_dict)
-		if hasattr(client_biometric_photo, 'read') or (hasattr(client_biometric_photo, 'stream') and hasattr(client_biometric_photo.stream, 'read')):
-			frappe.log_error(
-				title="Checkin Photo Debug",
-				message=f"client_biometric_photo is FileStorage object, reading bytes...",
-			)
-			client_biometric_photo = _read_file_storage(client_biometric_photo)
-			frappe.log_error(
-				title="Checkin Photo Debug",
-				message=f"Read client_biometric_photo from FileStorage, size: {len(client_biometric_photo) if client_biometric_photo else 0}",
-			)
-		# If it's already bytes or string, keep it as is
-		elif isinstance(client_biometric_photo, (bytes, str)):
-			frappe.log_error(
-				title="Checkin Photo Debug",
-				message=f"client_biometric_photo is already bytes/string, size: {len(client_biometric_photo) if client_biometric_photo else 0}",
-			)
-	# If client_biometric_photo is None/empty, try to get from request_files
-	elif request_files:
-		file_storage = request_files.get("client_biometric_photo")
-		if file_storage:
-			frappe.log_error(
-				title="Checkin Photo Debug",
-				message=f"Found client_biometric_photo in request_files, filename: {getattr(file_storage, 'filename', 'unknown')}",
-			)
-			client_biometric_photo = _read_file_storage(file_storage)
-			frappe.log_error(
-				title="Checkin Photo Debug",
-				message=f"Read client_biometric_photo from request_files, size: {len(client_biometric_photo) if client_biometric_photo else 0}",
-			)
+			distance = None
+		
+		# Validate required photos
+		location_photo_file = None
+		client_biometric_photo_file = None
+		
+		if settings["required_to_upload_location_photo"]:
+			if not location_photo and not location_photo_id:
+				action = "check-in" if log_type == "IN" else "check-out"
+				return {"exception": _("Location photo is required for {0}.").format(action)}
+			if location_photo_id and not frappe.db.exists("File", location_photo_id):
+				raise ValidationError(
+					_("Location photo file not found. Please upload the photo again.")
+				)
+		
+		if settings["required_to_upload_client_bio_metric_photo"]:
+			if not client_biometric_photo and not client_biometric_photo_id:
+				action = "check-in" if log_type == "IN" else "check-out"
+				return {
+					"exception": _("Client biometric photo is required for {0}.").format(action)
+				}
+			if client_biometric_photo_id and not frappe.db.exists("File", client_biometric_photo_id):
+				raise ValidationError(
+					_("Client biometric photo file not found. Please upload the photo again.")
+				)
+		
+		# Parse timestamp
+		if timestamp:
+			try:
+				checkin_time = get_datetime(timestamp)
+				if checkin_time.tzinfo is not None:
+					from datetime import timezone
+					checkin_time = checkin_time.astimezone(timezone.utc).replace(tzinfo=None)
+				checkin_time = checkin_time.replace(microsecond=0)
+			except Exception as e:
+				raise ValidationError(
+					_("Invalid timestamp format. Please use ISO 8601 format (e.g., 2025-01-27T09:15:30Z). Error: {0}").format(
+						str(e)
+					)
+				)
 		else:
-			frappe.log_error(
-				title="Checkin Photo Debug",
-				message="client_biometric_photo not found in request_files",
-			)
-
-	# Get employee record with clear error messages
-	if employee_id:
-		if not frappe.db.exists("Employee", employee_id):
-			frappe.throw(
-				_("Employee not found. Please check the employee ID and try again."),
-				DoesNotExistError
-			)
-		try:
-			employee = frappe.get_doc("Employee", employee_id)
-		except Exception as e:
-			frappe.throw(
-				_("Error retrieving employee record: {0}").format(str(e)),
-				DoesNotExistError
-			)
-	else:
-		employee_name = frappe.db.get_value("Employee", {"user_id": frappe.session.user}, "name")
-		if not employee_name:
-			frappe.throw(
-				_("Employee not found for user {0}. Please ensure your user account is linked to an employee record.").format(frappe.session.user),
-				DoesNotExistError
-			)
-		try:
-			employee = frappe.get_doc("Employee", employee_name)
-		except Exception as e:
-			frappe.throw(
-				_("Error retrieving employee record: {0}").format(str(e)),
-				DoesNotExistError
-			)
-	
-	# Validate employee is active
-	# The validate_active_employee function will throw a clear error if employee is inactive
-	validate_active_employee(employee.name)
-	
-	# Validate log_type
-	if not log_type or log_type not in ["IN", "OUT"]:
-		frappe.throw(
-			_("Invalid log_type. Must be 'IN' for check-in or 'OUT' for check-out."),
-			ValidationError
+			checkin_time = get_datetime().replace(microsecond=0)
+		
+		# Ensure only one IN and one OUT per employee per date
+		from datetime import timedelta
+		start_of_day = checkin_time.replace(hour=0, minute=0, second=0, microsecond=0)
+		end_of_day = start_of_day + timedelta(days=1)
+		
+		existing_count = frappe.db.count(
+			"Employee Checkin",
+			filters={
+				"employee": employee.name,
+				"log_type": log_type,
+				"time": ["between", [start_of_day, end_of_day]],
+			},
 		)
-	
-	# Get employee settings and branch info
-	settings = _get_employee_settings(employee)
-	
-	# Validate location
-	# For check-in: always required
-	# For check-out: only if require_location_check_on_check_out is True
-	if log_type == "IN":
-		# Check-in: location is always required
-		if not latitude or not longitude:
-			frappe.throw(
-				_("Location is required for check-in. Please provide latitude and longitude."),
-				ValidationError
-			)
-		distance = _validate_location(
-			latitude, longitude,
-			settings["branch_latitude"],
-			settings["branch_longitude"],
-			settings["branch_radius"],
-			log_type
-		)
-	elif settings["require_location_check_on_check_out"]:
-		# Check-out: location required only if setting is true
-		if not latitude or not longitude:
-			frappe.throw(
-				_("Location is required for check-out. Please provide latitude and longitude."),
-				ValidationError
-			)
-		distance = _validate_location(
-			latitude, longitude,
-			settings["branch_latitude"],
-			settings["branch_longitude"],
-			settings["branch_radius"],
-			log_type
-		)
-	else:
-		# Check-out: location not required
-		distance = None
-	
-	# Validate required photos
-	location_photo_file = None
-	client_biometric_photo_file = None
-	
-	# Validate required photos with clear error messages
-	# Handle location photo
-	if settings["required_to_upload_location_photo"]:
-		if not location_photo and not location_photo_id:
+		if existing_count > 0:
 			action = "check-in" if log_type == "IN" else "check-out"
-			frappe.throw(
-				_("Location photo is required for {0}. Please capture and upload a location photo before proceeding.").format(action),
-				ValidationError
+			date_str = start_of_day.date().strftime("%B %d, %Y")
+			raise ValidationError(
+				_(
+					"You have already completed your {0} for {1}. Only one check-in and one check-out are allowed per day."
+				).format(action, date_str)
 			)
-		# Validate that if location_photo_id is provided, the file exists
-		if location_photo_id and not frappe.db.exists("File", location_photo_id):
-			frappe.throw(
-				_("Location photo file not found. Please upload the photo again."),
-				ValidationError
-			)
-	
-	# Handle client biometric photo
-	if settings["required_to_upload_client_bio_metric_photo"]:
-		if not client_biometric_photo and not client_biometric_photo_id:
-			action = "check-in" if log_type == "IN" else "check-out"
-			frappe.throw(
-				_("Client biometric photo is required for {0}. Please capture and upload a client biometric photo before proceeding.").format(action),
-				ValidationError
-			)
-		# Validate that if client_biometric_photo_id is provided, the file exists
-		if client_biometric_photo_id and not frappe.db.exists("File", client_biometric_photo_id):
-			frappe.throw(
-				_("Client biometric photo file not found. Please upload the photo again."),
-				ValidationError
-			)
-	
-	# Parse timestamp with clear error message
-	if timestamp:
+		
+		# Create Employee Checkin record
+		checkin_doc = frappe.new_doc("Employee Checkin")
+		checkin_doc.employee = employee.name
+		checkin_doc.employee_name = getattr(employee, "employee_name", None) or employee.name
+		checkin_doc.log_type = log_type
+		checkin_doc.time = checkin_time
+		checkin_doc.latitude = float(latitude) if latitude else None
+		checkin_doc.longitude = float(longitude) if longitude else None
+		checkin_doc.device_id = device_id
+		if notes and hasattr(checkin_doc, "notes"):
+			checkin_doc.notes = notes
+		
+		checkin_doc.set_geolocation()
+		checkin_doc.fetch_shift()
+		
 		try:
-			checkin_time = get_datetime(timestamp)
-			# Convert timezone-aware datetime to naive datetime for MySQL compatibility
-			# MySQL DATETIME doesn't support timezone offsets
-			if checkin_time.tzinfo is not None:
-				# Convert to UTC and make naive (MySQL stores as naive datetime)
-				from datetime import timezone
-				checkin_time = checkin_time.astimezone(timezone.utc).replace(tzinfo=None)
-			# Remove microseconds as Employee Checkin doctype does
-			checkin_time = checkin_time.replace(microsecond=0)
+			checkin_doc.insert()
+			frappe.db.commit()
+		except frappe.DuplicateEntryError:
+			raise ValidationError(
+				_("A check-in record already exists for this timestamp. Please wait a moment and try again, or use a different timestamp.")
+			)
 		except Exception as e:
-			frappe.throw(
-				_("Invalid timestamp format. Please use ISO 8601 format (e.g., 2025-01-27T09:15:30Z). Error: {0}").format(str(e)),
-				ValidationError
+			msg = str(e)
+			if "duplicate" in msg.lower():
+				raise ValidationError(
+					_("A check-in record already exists for this timestamp. Please wait a moment and try again.")
+				)
+			raise ValidationError(_("Error creating check-in record: {0}").format(msg))
+		
+		# Upload and/or link photos
+		if location_photo:
+			location_photo_file = _handle_photo_upload(
+				location_photo, employee.name, checkin_doc.name, "location"
 			)
-	else:
-		checkin_time = get_datetime()
-		# Remove microseconds as Employee Checkin doctype does
-		checkin_time = checkin_time.replace(microsecond=0)
-	
-	# Ensure only one check-in and one check-out per employee per date
-	# We consider the "date" component of checkin_time (already made naive above).
-	from datetime import timedelta
-	start_of_day = checkin_time.replace(hour=0, minute=0, second=0, microsecond=0)
-	end_of_day = start_of_day + timedelta(days=1)
-	
-	existing_count = frappe.db.count(
-		"Employee Checkin",
-		filters={
-			"employee": employee.name,
-			"log_type": log_type,
-			"time": ["between", [start_of_day, end_of_day]],
-		},
-	)
-	if existing_count > 0:
-		action = "check-in" if log_type == "IN" else "check-out"
-		frappe.throw(
-			_(
-				"You already have a {0} record for {1}. Only one check-in and one check-out are allowed per day."
-			).format(action, start_of_day.date().isoformat()),
-			ValidationError,
-		)
-	
-	# Create Employee Checkin record
-	checkin_doc = frappe.new_doc("Employee Checkin")
-	checkin_doc.employee = employee.name
-	checkin_doc.employee_name = getattr(employee, "employee_name", None) or employee.name
-	checkin_doc.log_type = log_type
-	checkin_doc.time = checkin_time
-	checkin_doc.latitude = float(latitude) if latitude else None
-	checkin_doc.longitude = float(longitude) if longitude else None
-	checkin_doc.device_id = device_id
-	# Set notes only if the field exists (it may be a custom field)
-	if notes and hasattr(checkin_doc, "notes"):
-		checkin_doc.notes = notes
-	
-	# Set geolocation (this will populate geolocation field from lat/long)
-	checkin_doc.set_geolocation()
-	
-	# Fetch shift information
-	checkin_doc.fetch_shift()
-	
-	# Validate duplicate log (this is done in Employee Checkin validate method)
-	# We'll let the doc validation handle it
-	
-	# Insert the checkin record with proper error handling
-	try:
-		checkin_doc.insert()
-		# Explicitly commit so that the record is guaranteed to be written
-		# This is mainly to avoid any edge cases where the transaction might be left uncommitted
-		frappe.db.commit()
-	except frappe.DuplicateEntryError:
-		frappe.throw(
-			_("A check-in record already exists for this timestamp. Please wait a moment and try again, or use a different timestamp."),
-			ValidationError
-		)
-	except Exception as e:
-		# Catch any other validation errors from Employee Checkin doctype
-		error_msg = str(e)
-		if "duplicate" in error_msg.lower():
-			frappe.throw(
-				_("A check-in record already exists for this timestamp. Please wait a moment and try again."),
-				ValidationError
-			)
-		else:
-			# Re-raise with clearer message if possible
-			frappe.throw(
-				_("Error creating check-in record: {0}").format(error_msg),
-				ValidationError
-			)
-	
-	# Upload and/or link photos
-	# Location photo: if a photo (or file id) is provided, always store/link it,
-	# even if the setting "required_to_upload_location_photo" is disabled.
-	frappe.log_error(
-		title="Checkin Photo Debug",
-		message=f"Before upload - loc_photo: {bool(location_photo)}, loc_id: {location_photo_id}, checkin: {checkin_doc.name}",
-	)
-	if location_photo:
-		frappe.log_error(
-			title="Checkin Photo Debug",
-			message=f"Uploading location_photo, type: {type(location_photo)}, size: {len(location_photo) if isinstance(location_photo, (bytes, str)) else 'N/A'}",
-		)
-		location_photo_file = _handle_photo_upload(
-			location_photo, employee.name, checkin_doc.name, "location"
-		)
-		frappe.log_error(
-			title="Checkin Photo Debug",
-			message=f"location_photo upload result - created: {location_photo_file is not None}, file_id: {location_photo_file.name if location_photo_file else 'None'}",
-		)
-	elif location_photo_id:
-		# Link existing file
-		frappe.log_error(
-			title="Checkin Photo Debug",
-			message=f"Linking existing file: {location_photo_id}",
-		)
-		if frappe.db.exists("File", location_photo_id):
+		elif location_photo_id and frappe.db.exists("File", location_photo_id):
 			file_doc = frappe.get_doc("File", location_photo_id)
 			file_doc.attached_to_doctype = "Employee Checkin"
 			file_doc.attached_to_name = checkin_doc.name
 			file_doc.save(ignore_permissions=True)
 			location_photo_file = file_doc
-			frappe.log_error(
-				title="Checkin Photo Debug",
-				message=f"Linked location_photo_id: {location_photo_id}",
+		
+		if client_biometric_photo:
+			client_biometric_photo_file = _handle_photo_upload(
+				client_biometric_photo, employee.name, checkin_doc.name, "biometric"
 			)
-		else:
-			frappe.log_error(
-				title="Checkin Photo Debug",
-				message=f"File not found for location_photo_id: {location_photo_id}",
-			)
-	else:
-		frappe.log_error(
-			title="Checkin Photo Debug",
-			message="No location_photo or location_photo_id provided",
-		)
-	
-	# Client biometric photo: same behavior
-	frappe.log_error(
-		title="Checkin Photo Debug",
-		message=f"Before upload - bio_photo: {bool(client_biometric_photo)}, bio_id: {client_biometric_photo_id}",
-	)
-	if client_biometric_photo:
-		frappe.log_error(
-			title="Checkin Photo Debug",
-			message=f"Uploading client_biometric_photo, type: {type(client_biometric_photo)}, size: {len(client_biometric_photo) if isinstance(client_biometric_photo, (bytes, str)) else 'N/A'}",
-		)
-		client_biometric_photo_file = _handle_photo_upload(
-			client_biometric_photo, employee.name, checkin_doc.name, "biometric"
-		)
-		frappe.log_error(
-			title="Checkin Photo Debug",
-			message=f"client_biometric_photo upload result - created: {client_biometric_photo_file is not None}, file_id: {client_biometric_photo_file.name if client_biometric_photo_file else 'None'}",
-		)
-	elif client_biometric_photo_id:
-		# Link existing file
-		frappe.log_error(
-			title="Checkin Photo Debug",
-			message=f"Linking existing file: {client_biometric_photo_id}",
-		)
-		if frappe.db.exists("File", client_biometric_photo_id):
+		elif client_biometric_photo_id and frappe.db.exists("File", client_biometric_photo_id):
 			file_doc = frappe.get_doc("File", client_biometric_photo_id)
 			file_doc.attached_to_doctype = "Employee Checkin"
 			file_doc.attached_to_name = checkin_doc.name
 			file_doc.save(ignore_permissions=True)
 			client_biometric_photo_file = file_doc
-			frappe.log_error(
-				title="Checkin Photo Debug",
-				message=f"Linked client_biometric_photo_id: {client_biometric_photo_id}",
+		
+		updated_values = {}
+		if location_photo_file and hasattr(checkin_doc, "custom_location_photo"):
+			updated_values["custom_location_photo"] = location_photo_file.file_url
+		if client_biometric_photo_file and hasattr(checkin_doc, "custom_client_bio_metric_photo"):
+			updated_values["custom_client_bio_metric_photo"] = client_biometric_photo_file.file_url
+		if updated_values:
+			frappe.db.set_value("Employee Checkin", checkin_doc.name, updated_values, update_modified=False)
+		
+		# Success response
+		response = {
+			"checkin_id": checkin_doc.name,
+			"employee_id": getattr(employee, "employee_code", None)
+			or getattr(employee, "employee_number", None)
+			or employee.name,
+			"employee_name": getattr(employee, "employee_name", None) or employee.name,
+			"log_type": log_type,
+			"time": checkin_doc.time.isoformat()
+			if hasattr(checkin_doc.time, "isoformat")
+			else str(checkin_doc.time),
+			"latitude": checkin_doc.latitude,
+			"longitude": checkin_doc.longitude,
+			"shift": checkin_doc.shift,
+			"shift_start": checkin_doc.shift_start.isoformat()
+			if checkin_doc.shift_start and hasattr(checkin_doc.shift_start, "isoformat")
+			else (str(checkin_doc.shift_start) if checkin_doc.shift_start else None),
+			"shift_end": checkin_doc.shift_end.isoformat()
+			if checkin_doc.shift_end and hasattr(checkin_doc.shift_end, "isoformat")
+			else (str(checkin_doc.shift_end) if checkin_doc.shift_end else None),
+			"attendance": checkin_doc.attendance,
+			"status": "success",
+		}
+		
+		if distance is not None:
+			response["distance_from_branch_meters"] = round(distance, 2)
+		
+		if location_photo_file:
+			response["location_photo_url"] = location_photo_file.file_url
+			response["location_photo_id"] = location_photo_file.name
+		
+		if client_biometric_photo_file:
+			response["client_biometric_photo_url"] = client_biometric_photo_file.file_url
+			response["client_biometric_photo_id"] = client_biometric_photo_file.name
+		
+		return response
+	
+	# Convert known validation-type errors into the minimal mobile format
+	except (ValidationError, DoesNotExistError, CheckinRadiusExceededError) as e:
+		return {"exception": str(e)}
+	except Exception as e:
+		# Log unexpected errors for debugging, but still return a clean message to mobile
+		frappe.log_error(title="Checkin API Unexpected Error", message=str(e))
+		return {
+			"exception": _(
+				"Something went wrong while creating your check-in. Please try again or contact support."
 			)
-		else:
-			frappe.log_error(
-				title="Checkin Photo Debug",
-				message=f"File not found for client_biometric_photo_id: {client_biometric_photo_id}",
-			)
-	else:
-		frappe.log_error(
-			title="Checkin Photo Debug",
-			message="No client_biometric_photo or client_biometric_photo_id provided",
-		)
-
-	# If custom Attach fields exist on Employee Checkin, populate them with file URLs
-	# so that they show up in the form's "Location Photo" and "Client Bio Metric Photo" fields.
-	# These are expected to be Data/Attach fields named:
-	# - custom_location_photo
-	# - custom_client_bio_metric_photo
-	updated_values = {}
-	if location_photo_file and hasattr(checkin_doc, "custom_location_photo"):
-		updated_values["custom_location_photo"] = location_photo_file.file_url
-	if client_biometric_photo_file and hasattr(checkin_doc, "custom_client_bio_metric_photo"):
-		updated_values["custom_client_bio_metric_photo"] = client_biometric_photo_file.file_url
-	if updated_values:
-		frappe.db.set_value("Employee Checkin", checkin_doc.name, updated_values, update_modified=False)
-	
-	# Build response
-	response = {
-		"checkin_id": checkin_doc.name,
-		"employee_id": getattr(employee, "employee_code", None) or getattr(employee, "employee_number", None) or employee.name,
-		"employee_name": getattr(employee, "employee_name", None) or employee.name,
-		"log_type": log_type,
-		"time": checkin_doc.time.isoformat() if hasattr(checkin_doc.time, "isoformat") else str(checkin_doc.time),
-		"latitude": checkin_doc.latitude,
-		"longitude": checkin_doc.longitude,
-		"shift": checkin_doc.shift,
-		"shift_start": checkin_doc.shift_start.isoformat() if checkin_doc.shift_start and hasattr(checkin_doc.shift_start, "isoformat") else (str(checkin_doc.shift_start) if checkin_doc.shift_start else None),
-		"shift_end": checkin_doc.shift_end.isoformat() if checkin_doc.shift_end and hasattr(checkin_doc.shift_end, "isoformat") else (str(checkin_doc.shift_end) if checkin_doc.shift_end else None),
-		"attendance": checkin_doc.attendance,
-		"status": "success",
-	}
-	
-	if distance is not None:
-		response["distance_from_branch_meters"] = round(distance, 2)
-	
-	if location_photo_file:
-		response["location_photo_url"] = location_photo_file.file_url
-		response["location_photo_id"] = location_photo_file.name
-	
-	if client_biometric_photo_file:
-		response["client_biometric_photo_url"] = client_biometric_photo_file.file_url
-		response["client_biometric_photo_id"] = client_biometric_photo_file.name
-	
-	return response
-
-
+		}
 @frappe.whitelist()
 def get_employee_checkin_records(
 	employee_id=None,
@@ -1337,4 +1154,3 @@ def get_employee_checkin_records(
 	}
 	
 	return response
-
