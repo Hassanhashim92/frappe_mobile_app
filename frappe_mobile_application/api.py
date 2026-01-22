@@ -800,6 +800,24 @@ def create_checkin_checkout(
 		start_of_day = checkin_time.replace(hour=0, minute=0, second=0, microsecond=0)
 		end_of_day = start_of_day + timedelta(days=1)
 		
+		# If checking out, ensure there's a check-in record for today first
+		if log_type == "OUT":
+			checkin_exists = frappe.db.exists(
+				"Employee Checkin",
+				{
+					"employee": employee.name,
+					"log_type": "IN",
+					"time": ["between", [start_of_day, end_of_day]],
+				},
+			)
+			if not checkin_exists:
+				date_str = start_of_day.date().strftime("%B %d, %Y")
+				raise ValidationError(
+					_(
+						"You must check-in before you can check-out. No check-in record found for {0}."
+					).format(date_str)
+				)
+		
 		existing_count = frappe.db.count(
 			"Employee Checkin",
 			filters={
@@ -917,10 +935,13 @@ def create_checkin_checkout(
 	
 	# Convert known validation-type errors into the minimal mobile format
 	except (ValidationError, DoesNotExistError, CheckinRadiusExceededError) as e:
+		# Set HTTP status code to 401 for validation errors (including duplicate check-ins)
+		frappe.local.response.http_status_code = 401
 		return {"exception": str(e)}
 	except Exception as e:
 		# Log unexpected errors for debugging, but still return a clean message to mobile
 		frappe.log_error(title="Checkin API Unexpected Error", message=str(e))
+		frappe.local.response.http_status_code = 500
 		return {
 			"exception": _(
 				"Something went wrong while creating your check-in. Please try again or contact support."
